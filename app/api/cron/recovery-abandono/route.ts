@@ -34,15 +34,26 @@ export async function GET(req: Request) {
     .select('id, nome, telefone, email, itens, total_usd, created_at, contatado, convertido')
     .lt('created_at', cutoff)
     .gt('created_at', recentLimit)
-    .is('convertido', null)
-    .is('contatado', null)
+    // As duas colunas têm `default false`, não NULL — `.is(null)` não casa com
+    // `false` e a query devolvia ZERO linhas desde sempre, com o cron
+    // respondendo {ok:true} a cada 2h. Nenhum dos 14 carrinhos salvos até
+    // 22/08/2026 chegou a ser contatado por causa disto.
+    .or('convertido.is.null,convertido.eq.false')
+    .or('contatado.is.null,contatado.eq.false')
     .order('created_at', { ascending: false })
     .limit(50)
 
-  if (!abandonos?.length) return NextResponse.json({ ok: true, processados: 0 })
+  if (!abandonos?.length) {
+    return NextResponse.json({
+      ok: true, candidatos: 0, enviados: 0, falhas: 0,
+      janela: { de: recentLimit, ate: cutoff, minutos_minimos: minMinutes },
+    })
+  }
 
   let enviados = 0
+  let falhas = 0
   for (const cart of abandonos) {
+    let enviou = false
     const itensArr = Array.isArray(cart.itens) ? cart.itens : []
     const linhas = itensArr.slice(0, 5).map((i: { name?: string; qty?: number }) =>
       `<tr><td style="padding:6px 0;font-size:13px;color:#555">${i.name || ''} ×${i.qty || 1}</td></tr>`).join('')
@@ -61,10 +72,25 @@ export async function GET(req: Request) {
         </td></tr></table></td></tr></table></body></html>`
       const ok = await sendEmail(cart.email, `${cart.nome || 'Olá'}, você esqueceu seu carrinho 🛒`, html)
       if (ok) enviados++
+      enviou = ok
     }
 
-    await supabaseAdmin.from('cart_sessions').update({ contatado: true }).eq('id', cart.id)
+    // Só marca como contatado se a mensagem REALMENTE saiu. Antes marcava
+    // sempre: uma falha do Resend queimava o carrinho para sempre, sem retry e
+    // sem log. Carrinho sem e-mail também é marcado — não há o que retentar.
+    if (enviou || !cart.email) {
+      await supabaseAdmin.from('cart_sessions').update({ contatado: true }).eq('id', cart.id)
+    } else {
+      falhas++
+    }
   }
 
-  return NextResponse.json({ ok: true, processados: abandonos.length, enviados })
+  // A resposta descreve a janela e o que sobrou. `{ok:true, processados:0}` era
+  // indistinguível de "filtro quebrado" e de "não há nada a fazer" — foi o que
+  // escondeu o bug acima por meses.
+  return NextResponse.json({
+    ok: true,
+    janela: { de: recentLimit, ate: cutoff, minutos_minimos: minMinutes },
+    candidatos: abandonos.length, enviados, falhas,
+  })
 }
